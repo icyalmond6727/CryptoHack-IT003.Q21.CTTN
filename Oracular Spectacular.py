@@ -1,15 +1,36 @@
 import json
-import math
 from pwn import *
 
 HOST = "socket.cryptohack.org"
 PORT = 13423
 
 ALPHABET = b"0123456789abcdef"
+THRESH = 0.999
+EXPLORE = 2
+BATCH = 8
+
+def update_probs(probs, guess, is_false):
+    a, b = (0.6, 0.4) if is_false else (0.4, 0.6)
+    old_p = probs[guess]
+    
+    den = old_p * a + (1 - old_p) * b
+    new_p = old_p * a / den
+    
+    scale = (1 - new_p) / (1 - old_p)
+    for c in ALPHABET:
+        if c == guess:
+            probs[c] = new_p
+        else:
+            probs[c] *= scale
 
 def solve():
     r = remote(HOST, PORT)
-    r.recvline()
+    
+    try:
+        r.recvline(timeout=0.5)
+        r.recvline(timeout=0.5)
+    except EOFError:
+        pass
 
     r.sendline(json.dumps({"option": "encrypt"}).encode())
     res = json.loads(r.recvline().decode())
@@ -31,48 +52,50 @@ def solve():
         for pad_val in range(1, 17):
             idx = 16 - pad_val
             
-            scores = {c: 0.0 for c in ALPHABET}
+            probs = {c: 1.0 / 16.0 for c in ALPHABET}
+            
+            def forge_payload(guess):
+                C_prev_mod = bytearray(C_prev)
+                for j in range(idx + 1, 16):
+                    C_prev_mod[j] = intermediate[j] ^ pad_val
+                C_prev_mod[idx] = guess ^ pad_val ^ C_prev[idx]
+                return (C_prev_mod + C_curr).hex()
+
+            jobs = []
+            for guess in ALPHABET:
+                jobs.extend([guess] * EXPLORE)
+                
+            for i in range(0, len(jobs), BATCH):
+                chunk = jobs[i:i+BATCH]
+                
+                for guess in chunk:
+                    payload = forge_payload(guess)
+                    r.sendline(json.dumps({"option": "unpad", "ct": payload}).encode())
+                    
+                for guess in chunk:
+                    resp = json.loads(r.recvline().decode())
+                    update_probs(probs, guess, not resp["result"])
             
             while True:
-                max_score = max(scores.values())
-                sum_exp = sum(math.exp(s - max_score) for s in scores.values())
-                probs = {c: math.exp(s - max_score) / sum_exp for c, s in scores.items()}
-                
                 winner = max(probs, key=probs.get)
                 
-                if probs[winner] > 0.999:
-                    print(f"[*] Block {block_idx} - Byte {idx:02d} found: {chr(winner)} (Weight: {probs[winner]:.4f})")
+                if probs[winner] >= THRESH:
+                    print(f"[*] Block {block_idx} - Byte {idx:02d} found: {chr(winner)} (Chance: {probs[winner]:.4f})")
                     plaintext[idx] = winner
-                    intermediate[idx] = winner ^ pad_val ^ C_prev[idx]
+                    intermediate[idx] = winner ^ C_prev[idx]
                     break
-                
-                candidates = [c for c in ALPHABET if probs[c] > 0.001]
-                
-                for i in range(0, len(candidates), 8):
-                    batch = candidates[i:i+8]
                     
-                    for guess in batch:
-                        C_prev_mod = bytearray(C_prev)
-                        
-                        for j in range(idx + 1, 16):
-                            C_prev_mod[j] = intermediate[j] ^ pad_val
-                            
-                        C_prev_mod[idx] = guess ^ pad_val ^ C_prev[idx]
-                        
-                        payload = (C_prev_mod + C_curr).hex()
-                        req = {"option": "unpad", "ct": payload}
-                        r.sendline(json.dumps(req).encode())
-                        
-                    for guess in batch:
-                        resp = json.loads(r.recvline().decode())
-                        
-                        if resp["result"] == False:
-                            scores[guess] += math.log(0.6 / 0.4)
-                        else:
-                            scores[guess] += math.log(0.4 / 0.6)
-                            
+                chunk = [winner] * min(BATCH, 12000)
+                for guess in chunk:
+                    payload = forge_payload(guess)
+                    r.sendline(json.dumps({"option": "unpad", "ct": payload}).encode())
+                    
+                for guess in chunk:
+                    resp = json.loads(r.recvline().decode())
+                    update_probs(probs, guess, not resp["result"])
+                    
         flag_hex += plaintext
-        print(f"[+] Block {block_idx}: {plaintext.decode()}")
+        print(f"[+] Block {block_idx} decoded: {plaintext.decode()}")
         
     recovered_message = flag_hex.decode()
     print(f"\n[+] Recovered message: {recovered_message}")
